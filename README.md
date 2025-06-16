@@ -1,1 +1,1 @@
-# C-CUDA
+# CPP-CUDA
