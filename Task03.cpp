@@ -1,183 +1,139 @@
-/*Task 3: Advanced Thread Pool with Task Scheduling (Individual)
-
-Design a thread pool supporting priority-based task scheduling, dependencies between tasks, and error propagation.
-
-Use std:: priority_queue, std::condition_variable, and std:: future effectively.
-
-Demonstrate with examples clearly showing task priorities, dependencies, and exception handling.*/
-
-
-
 #include <iostream>
 #include <queue>
-#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <functional>
 #include <future>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <map>
+#include <vector>
+#include <memory>
 #include <chrono>
-#include <algorithm>  // ←  Add this to fix all_of error
 
-
-using namespace std;
-
-// Task wrapper with priority and dependencies
-struct Task {
+// Struct to represent a task with priority
+struct TaskItem {
     int priority;
-    function<void()> func;
-    vector<shared_future<void>> dependencies;
+    std::function<void()> func;
 
-    // For priority_queue ordering (max-heap, so higher priority comes first)
-    bool operator<(const Task& other) const {
-        return priority < other.priority;
+    bool operator<(const TaskItem& other) const {
+        return priority < other.priority; // Higher priority = earlier execution
     }
 };
 
-// Thread Pool class
 class ThreadPool {
 public:
-    ThreadPool(size_t threads);
-    ~ThreadPool();
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    TaskItem task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] {
+                            return stop || !taskQueue.empty();
+                        });
 
-    future<void> submit(function<void()> f, int priority = 0, vector<shared_future<void>> deps = {});
+                        if (stop && taskQueue.empty())
+                            return;
+
+                        task = taskQueue.top();
+                        taskQueue.pop();
+                    }
+                    try {
+                        task.func(); // May throw, will be captured by packaged_task
+                    } catch (...) {
+                        std::cerr << "[ThreadPool] Unhandled exception in task.\n";
+                    }
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread& t : workers)
+            t.join();
+    }
+
+    // Submit with optional priority and dependency
+    template <class Func>
+    std::future<void> submit(Func&& f, int priority = 0, std::shared_future<void> dependency = {}) {
+        using TaskType = std::packaged_task<void()>;
+        auto taskPtr = std::make_shared<TaskType>(std::forward<Func>(f));
+        std::future<void> fut = taskPtr->get_future();
+
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            taskQueue.emplace(TaskItem{
+                priority,
+                [taskPtr, dep = std::move(dependency)]() mutable {
+                    if (dep.valid()) dep.get();  // Wait for dependency
+                    (*taskPtr)();                // Run task (will capture exceptions)
+                }
+            });
+        }
+        condition.notify_one();
+        return fut;
+    }
 
 private:
-    vector<thread> workers;
-    priority_queue<Task> tasks;
-    mutex queue_mutex;
-    condition_variable condition;
+    std::vector<std::thread> workers;
+    std::priority_queue<TaskItem> taskQueue;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
     bool stop;
-
-    void workerThread();
 };
 
-// Constructor: launches threads
-ThreadPool::ThreadPool(size_t threads) : stop(false) {
-    for (size_t i = 0; i < threads; ++i)
-        workers.emplace_back([this] { this->workerThread(); });
-}
-
-// Destructor: joins threads
-ThreadPool::~ThreadPool() {
-    {
-        unique_lock<mutex> lock(queue_mutex);
-        stop = true;
-    }
-    condition.notify_all();
-    for (thread &worker: workers)
-        worker.join();
-}
-
-// Submit a task with priority and dependencies
-future<void> ThreadPool::submit(function<void()> f, int priority, vector<shared_future<void>> deps) {
-    auto task_promise = make_shared<promise<void>>();
-    auto task_future = task_promise->get_future();
-
-    Task task;
-    task.priority = priority;
-    task.dependencies = deps;
-    task.func = [f, task_promise]() {
-        try {
-            f();
-            task_promise->set_value();
-        } catch (...) {
-            task_promise->set_exception(current_exception());
-        }
-    };
-
-    {
-        unique_lock<mutex> lock(queue_mutex);
-        tasks.push(task);
-    }
-    condition.notify_one();
-    return task_future;
-}
-
-// Thread loop
-void ThreadPool::workerThread() {
-    while (true) {
-        Task task;
-        {
-            unique_lock<mutex> lock(queue_mutex);
-            condition.wait(lock, [this] { return stop || !tasks.empty(); });
-
-            if (stop && tasks.empty())
-                return;
-
-            // Wait if top task has unresolved dependencies
-            task = tasks.top();
-            bool ready = all_of(task.dependencies.begin(), task.dependencies.end(),
-                                [](const shared_future<void>& f) {
-                                    return f.wait_for(chrono::seconds(0)) == future_status::ready;
-                                });
-
-            if (!ready) {
-                condition.wait_for(lock, chrono::milliseconds(10));
-                continue;
-            }
-
-            tasks.pop();
-        }
-        task.func();
-    }
-}
-
-// ------------------------
-// Example usage
-// ------------------------
-int main() {
+// === Demonstration code ===
+void runExample() {
     ThreadPool pool(3);
 
-    // Task A (low priority)
-    auto futureA = pool.submit([] {
-        cout << "Task A (priority 1) starting\n";
-        this_thread::sleep_for(chrono::milliseconds(300));
-        cout << "Task A done\n";
+    // T1: Low priority (1)
+    auto t1 = pool.submit([] {
+        std::cout << "[T1] Low priority (1)\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }, 1);
 
-    // Task B (high priority)
-    auto futureB = pool.submit([] {
-        cout << "Task B (priority 10) starting\n";
-        this_thread::sleep_for(chrono::milliseconds(100));
-        cout << "Task B done\n";
+    // T2: High priority (10)
+    auto t2 = pool.submit([] {
+        std::cout << "[T2] High priority (10)\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }, 10);
 
-    // Task C (depends on A and B)
-    auto futureC = pool.submit([] {
-        cout << "Task C (depends on A & B) starting\n";
-        cout << "Task C done\n";
-    }, 5, { futureA.share(), futureB.share() });
+    // T3: Medium priority (5), depends on T1
+    auto dep1 = t1.share(); // shared_future allows multiple dependencies
+    auto t3 = pool.submit([] {
+        std::cout << "[T3] Medium priority (5), depends on T1\n";
+    }, 5, dep1);
 
-    // Task D (throws an exception)
-    auto futureD = pool.submit([] {
-        cout << "Task D (throws exception)\n";
-        throw runtime_error("Error in Task D");
-    }, 3);
+    // T4: Throws exception
+    auto t4 = pool.submit([] {
+        std::cout << "[T4] Throws an exception\n";
+        throw std::runtime_error("Intentional error!");
+    }, 7);
 
-    // Wait for all
-    futureC.wait();
+    // T5: Depends on T3
+    auto t5 = pool.submit([] {
+        std::cout << "[T5] Depends on T3\n";
+    }, 3, t3.share());
+
+    // Wait for all to finish and catch exceptions
     try {
-        futureD.get();
-    } catch (const exception& e) {
-        cout << "Caught exception from Task D: " << e.what() << endl;
+        t1.get();
+        t2.get();
+        t3.get();
+        t4.get(); // This will throw
+    } catch (const std::exception& ex) {
+        std::cerr << "[Main] Caught exception from T4: " << ex.what() << "\n";
     }
 
-    cout << "Main done\n";
-    return 0;
+    t5.get(); // Wait for final task
 }
 
-
-/*______
-OUTPUT:
-
-Task A (priority 1) starting
-Task B (priority 10) starting
-Task B done
-Task A done
-Task C (depends on A & B) starting
-Task C done
-Task D (throws exception)
-Caught exception from Task D: Error in Task D
-Main done  */
+int main() {
+    runExample();
+    return 0;
+}
